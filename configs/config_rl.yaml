@@ -28,7 +28,7 @@ pythia_rlhf_individual:
   rank_config:
     is_reward_model: true
     model_names: 
-      - models/rm-pythia-44m_seed1
+      - models/rm-pythia-44m_seed0
     cache_dir: .cache
     pooling: last
     residual_dropout: 0.01

@@ -3,6 +3,7 @@ import torch
 from datasets import load_dataset, Dataset
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 from typing import Union
+import tqdm
 
 from alpaca_farm.models.reward_model import RewardModel
 from accelerate import Accelerator, DistributedType
@@ -65,7 +66,7 @@ def score_answers(
     split: str = "validation",
     scores_type: str = "gold_scores",
     sort: bool = False,
-    split_size: int = 32,
+    split_size: int = 128,
     is_alpacafarm_rm: bool = False,
 ) -> list:
     dataset = load_dataset(dataset)[split] if isinstance(dataset, str) else dataset
@@ -105,7 +106,7 @@ def score_answers(
                 split_size,
                 is_alpacafarm_rm=is_alpacafarm_rm,
             )[0]
-            for prompts in samples
+            for prompts in tqdm.tqdm(samples)
         ]
 
     # Otherwise create intra-prompt batches

@@ -54,6 +54,8 @@ def argument_parsing(notebook=False, notebook_args=None, **kwargs):
 
     for key, value in kwargs.items():
         type_ = type(value) if value is not None else str
+        if type_ == bool:
+            type_ = _strtobool
         parser.add_argument(f"--{key}", type=type_, default=value)
 
     for key, value in conf.items():
@@ -66,7 +68,12 @@ def argument_parsing(notebook=False, notebook_args=None, **kwargs):
 
 
 def main():
-    training_conf = argument_parsing()
+    training_conf = argument_parsing(
+        use_sqrt_chi2=False,
+        use_end_kl=False,
+        regularize_in_loss=False,
+        coeff=0.0,
+    )
     rank_config = Namespace(**training_conf.rank_config)
     sft_config = Namespace(**training_conf.sft_config)
     gold_config = Namespace(**training_conf.gold_config)
@@ -82,6 +89,12 @@ def main():
     # override model_name to be the same as sft_model
     trlx_config = TRLConfig.load_yaml("configs/ppo_config.yaml")
     trlx_config.sft_config = sft_config
+    trlx_config.method.use_end_kl = training_conf.use_end_kl
+    trlx_config.method.use_sqrt_chi2 = training_conf.use_sqrt_chi2
+    assert not (training_conf.use_end_kl and training_conf.use_sqrt_chi2)
+    trlx_config.method.init_kl_coef = training_conf.coeff
+    trlx_config.method.chi2_reward_clip = 10
+    trlx_config.method.regularize_in_loss = training_conf.regularize_in_loss
 
     train, eval_dict = get_dataset(training_conf, mode="rl")
     print(train, eval_dict)
@@ -112,14 +125,33 @@ def main():
 
     # Main changes ---------------------------------------------------------------------
 
-    output_dir = process_configs(training_conf, rank_config, trlx_config)
+    extra_dirs = ""
+    if training_conf.use_sqrt_chi2:
+        divergence_type = "sqrt_chi2"
+    elif training_conf.use_end_kl:
+        divergence_type = "end_kl"
+    else:
+        divergence_type = "kl"
+    if training_conf.regularize_in_loss:
+        divergence_type += "_in_loss_clipped"
+    else:
+        extra_dirs = f"clip_{trlx_config.method.chi2_reward_clip}/"
+    extra_dirs += f"{divergence_type}-{training_conf.coeff}"
+    if training_conf.rng_seed is not None:
+        extra_dirs += f"/seed_{training_conf.rng_seed}"
+    output_dir = process_configs(
+        training_conf,
+        rank_config,
+        trlx_config,
+        extra_dirs=extra_dirs,
+    )
 
     if training_conf.debug:
         print("Continuing in debug mode")
         prompts = prompts[:10]
         eval_prompts = eval_prompts[:10]
         trlx_config.method.num_rollouts = 1
-
+    
     reward_fn = get_reward_fn(rank_config, training_conf)
     trainer = trlx.train(
         sft_config.model_name,

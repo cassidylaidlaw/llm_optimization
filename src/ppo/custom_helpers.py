@@ -9,7 +9,7 @@ from src.reward_modeling.scoring.ppo_reward_functions import create_reward_fn
 from src.reward_modeling.scoring.score import score_answers
 
 
-def process_configs(training_conf, rank_config, trlx_config):
+def process_configs(training_conf, rank_config, trlx_config, extra_dirs=""):
     """Process the training and rank configs and set the output directory"""
 
     trlx_config.train.seed = training_conf.rng_seed
@@ -23,6 +23,8 @@ def process_configs(training_conf, rank_config, trlx_config):
         output_dir = f"{output_dir}/ensemble_{type}{weight_str}"
     else:
         output_dir = f"{output_dir}/{rank_config.model_names[0].replace('/', '_')}"
+
+    output_dir = f"{output_dir}/{extra_dirs}"
 
     trlx_config.train.output_dir = output_dir
     trlx_config.train.run_name = output_dir

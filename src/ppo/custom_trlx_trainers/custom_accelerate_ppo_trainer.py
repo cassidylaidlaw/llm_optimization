@@ -18,7 +18,6 @@ from transformers import AutoTokenizer
 import trlx.utils.logging as logging
 from trlx.data.accelerate_base_datatypes import PromptBatch
 from trlx.data.configs import TRLConfig
-from trlx.data.ppo_types import PPORLBatch, PPORLElement
 from trlx.models.modeling_ppo import (
     AdaptiveKLController,
     AutoModelForCausalLMWithHydraValueHead,
@@ -26,12 +25,16 @@ from trlx.models.modeling_ppo import (
     FixedKLController,
 )
 from trlx.pipeline.offline_pipeline import PromptPipeline
-from trlx.pipeline.ppo_pipeline import PPORolloutStorage
 from trlx.trainer import register_trainer
 from trlx.utils import Clock, infinite_dataloader
 from trlx.utils.modeling import RunningMoments, gather_dict, logprobs_of_labels
 from src.ppo.custom_trlx_trainers.custom_accelerate_base_trainer import (
     CustomAccelerateRLTrainer,
+)
+from src.ppo.custom_trlx_trainers.types_and_pipeline import (
+    PPOWithRefPolicyRLElement,
+    PPOWithRefPolicyRLBatch,
+    PPOWithRefPolicyRolloutStorage,
 )
 
 
@@ -63,7 +66,7 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
 
         # Setup the rollout store
         # Rollouts contain the prompt & response, log probs, values and rewards - from each rollout
-        self.store = PPORolloutStorage(self.tokenizer.pad_token_id, self.tokenizer.padding_side)
+        self.store = PPOWithRefPolicyRolloutStorage(self.tokenizer.pad_token_id, self.tokenizer.padding_side)
 
         # Create the rollout store dataloader (for batching up rollouts)
         # TODO (jon-tow): This is only used to satisfy to `accelerator.prepare` call constraint below - remove in future
@@ -88,6 +91,12 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
             self.kl_ctl = AdaptiveKLController(config.method.init_kl_coef, config.method.target, config.method.horizon)
         else:
             self.kl_ctl = FixedKLController(config.method.init_kl_coef)
+
+        # CHANGED
+        self.use_end_kl = config.method.use_end_kl
+        self.use_sqrt_chi2 = config.method.use_sqrt_chi2
+        self.chi2_reward_clip = config.method.chi2_reward_clip
+        # /CHANGED
 
         # Create the parameters for the Hugging Face language model's generator
         # method (that generates new tokens from a prompt).
@@ -147,7 +156,7 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
             **self.config.model.model_extra_configs,
         )
 
-    def loss(self, batch: PPORLBatch) -> Tuple[float, Dict[str, Any]]:
+    def loss(self, batch: PPOWithRefPolicyRLBatch) -> Tuple[float, Dict[str, Any]]:
         """Computes loss on a batch of data and returns statistics
 
         Args:
@@ -161,6 +170,7 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
         query_tensors = batch.query_tensors.to(self.accelerator.device)
         response_tensors = batch.response_tensors.to(self.accelerator.device)
         old_logprobs = batch.logprobs.to(self.accelerator.device)
+        ref_logprobs = batch.ref_logprobs.to(self.accelerator.device)
         old_values = batch.values.to(self.accelerator.device)
         old_rewards = batch.rewards.to(self.accelerator.device)
         response_length = old_rewards.shape[1]
@@ -214,14 +224,26 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
                 attention_mask[:, start + 1 : end + 1],
             )
 
+        # CHANGED
+        kl_weight: Optional[float] = None
+        sqrt_chi2_weight: Optional[float] = None
+        if self.config.method.regularize_in_loss:
+            if self.use_sqrt_chi2:
+                sqrt_chi2_weight = self.kl_ctl.value
+            else:
+                kl_weight = self.kl_ctl.value
+
         loss, stats = self.config.method.loss(
             logprobs=logprobs,
             values=values_pred,
             old_logprobs=old_logprobs,
+            ref_logprobs=ref_logprobs,
             old_values=old_values,
             advantages=advantages,
             returns=returns,
             mask=mask,
+            kl_weight=kl_weight,
+            sqrt_chi2_weight=sqrt_chi2_weight,
         )
 
         return loss, stats
@@ -296,6 +318,10 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
         clock = Clock()
         ppo_rl_elements = []
         accumulated_stats = []
+
+        # CHANGED
+        seq_ratios_m_1 = []
+        # /CHANGED
 
         while len(ppo_rl_elements) < num_rollouts:
             stats = {}
@@ -498,12 +524,14 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
                 start = prompt_tensors.shape[1] - 1
 
             log_ratio = (logprobs - ref_logprobs) * attention_mask[:, :-1]
+            log_ratio[:, :start] = 0
             kl = log_ratio.exp() - 1 - log_ratio
             mean_kl_per_token = kl.mean()
             mean_kl = kl.sum(1).mean()
 
             # CHANGED
             mean_kl_est = (log_ratio**2 / 2).sum(1).mean()
+            seq_ratio_m_1 = torch.special.expm1(log_ratio.sum(1))
             # /CHANGED
 
             logprobs = logprobs.cpu()
@@ -518,14 +546,25 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
             ends = start + attention_mask[:, start:].sum(1) + 1
             all_values = [values[ix, start : ends[ix]] for ix in range(n_samples)]
             all_logprobs = [logprobs[ix, start : ends[ix]] for ix in range(n_samples)]
+            all_ref_logprobs = [ref_logprobs[ix, start : ends[ix]] for ix in range(n_samples)]
 
+            # CHANGED
             kl_penalty = self.kl_ctl.value * -log_ratio.cpu()
             kl_penalty = [xs[start : ends[ix]] for ix, xs in enumerate(kl_penalty)]
+            # /CHANGED
 
             rollout_count = 0
 
             for sample_idx in range(n_samples):
-                rewards = kl_penalty[sample_idx]
+                # CHANGED
+                rewards = torch.zeros_like(kl_penalty[sample_idx])
+                if not self.config.method.regularize_in_loss:
+                    if self.use_end_kl:
+                        rewards[-1] = kl_penalty[sample_idx].sum()
+                    elif not self.use_sqrt_chi2:
+                        rewards += kl_penalty[sample_idx]
+                seq_ratios_m_1.append(seq_ratio_m_1[sample_idx].item())
+                # /CHANGED
                 # Then add in rewards
                 if scores.shape[1] == 1:
                     # NOTE: Final reward given at EOS token following HHH practice
@@ -539,17 +578,18 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
                     rewards += p_score
 
                 ppo_rl_elements.append(
-                    PPORLElement(
+                    PPOWithRefPolicyRLElement(
                         query_tensor=prompt_tensors[sample_idx],
                         response_tensor=sample_outputs[sample_idx],
                         logprobs=all_logprobs[sample_idx],
+                        ref_logprobs=all_ref_logprobs[sample_idx],
                         values=all_values[sample_idx],
                         rewards=rewards,
                     )
                 )
 
                 rollout_count += 1
-
+            
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(mean_kl, torch.distributed.ReduceOp.AVG)
 
@@ -576,8 +616,36 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
 
         stats["kl_ctl_value"] = self.kl_ctl.value
         self.mean_kl = stats["policy/sqrt_kl"] ** 2
-        self.accelerator.log(stats, step=iter_count)
 
+        # CHANGED
+        del seq_ratio_m_1
+        seq_ratios_m_1 = torch.tensor(seq_ratios_m_1)
+        chi2_est = seq_ratios_m_1.mean()
+        seq_ratios_m_1_sorted = torch.sort(seq_ratios_m_1).values
+        i = max(1, int(0.01 * len(seq_ratios_m_1_sorted)))
+        chi2_trimmed = torch.mean(seq_ratios_m_1_sorted[i:-i])
+        if chi2_trimmed.item() <= 0:
+            chi2_factor = 1.0
+        else:
+            chi2_factor = 1.0 / torch.sqrt(chi2_trimmed)
+
+        stats["policy/chi2"] = chi2_est.item()
+        stats["policy/chi2_trimmed"] = chi2_trimmed.item()
+
+        if self.use_sqrt_chi2 and not self.config.method.regularize_in_loss:
+            chi2_rewards = []
+            for sample_idx, element in enumerate(ppo_rl_elements):
+                chi2_reward = (
+                    self.kl_ctl.value * -seq_ratios_m_1[sample_idx] * chi2_factor
+                )
+                chi2_reward = chi2_reward.clip(min=-self.chi2_reward_clip, max=self.chi2_reward_clip).item()
+                element.rewards[-1] += chi2_reward
+                chi2_rewards.append(chi2_reward)
+            stats["policy/chi2_reward"] = np.mean(chi2_rewards)
+        # /CHANGED
+
+        self.accelerator.log(stats, step=iter_count)
+        
         # Push samples and rewards to trainer's rollout storage
         self.push_to_store(ppo_rl_elements)
 
