@@ -105,11 +105,13 @@ def main():
         instructions.append(prompt)
         answers.append([response])
 
-    dataset = Dataset.from_dict({
-        "instruction": instructions,
-        "answers": answers,
-        "answers_ids": answers_ids,
-    })
+    dataset = Dataset.from_dict(
+        {
+            "instruction": instructions,
+            "answers": answers,
+            "answers_ids": answers_ids,
+        }
+    )
 
     print("Scoring the generated responses with the proxy...")
     dataset = Dataset.from_list(
@@ -149,7 +151,9 @@ def main():
 
     results_fname = training_conf.output
     if not results_fname:
-        results_fname = os.path.join(training_conf.checkpoint, "gold_eval_with_response_ids.json")
+        results_fname = os.path.join(
+            training_conf.checkpoint, "gold_eval_with_response_ids.json"
+        )
 
     print(f"Saving results to {results_fname}...")
     with open(results_fname, "w") as results_file:
