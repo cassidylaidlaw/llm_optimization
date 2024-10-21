@@ -92,12 +92,6 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
         else:
             self.kl_ctl = FixedKLController(config.method.init_kl_coef)
 
-        # CHANGED
-        self.use_end_kl = config.method.use_end_kl
-        self.use_sqrt_chi2 = config.method.use_sqrt_chi2
-        self.chi2_reward_clip = config.method.chi2_reward_clip
-        # /CHANGED
-
         # Create the parameters for the Hugging Face language model's generator
         # method (that generates new tokens from a prompt).
         # https://huggingface.co/docs/transformers/v4.25.1/en/main_classes/text_generation#transformers.GenerationMixin.generate
@@ -319,10 +313,6 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
         ppo_rl_elements = []
         accumulated_stats = []
 
-        # CHANGED
-        seq_ratios_m_1 = []
-        # /CHANGED
-
         while len(ppo_rl_elements) < num_rollouts:
             stats = {}
             # Get next batch in prompt dataset
@@ -524,14 +514,12 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
                 start = prompt_tensors.shape[1] - 1
 
             log_ratio = (logprobs - ref_logprobs) * attention_mask[:, :-1]
-            log_ratio[:, :start] = 0
             kl = log_ratio.exp() - 1 - log_ratio
             mean_kl_per_token = kl.mean()
             mean_kl = kl.sum(1).mean()
 
             # CHANGED
             mean_kl_est = (log_ratio**2 / 2).sum(1).mean()
-            seq_ratio_m_1 = torch.special.expm1(log_ratio.sum(1))
             # /CHANGED
 
             logprobs = logprobs.cpu()
@@ -548,23 +536,12 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
             all_logprobs = [logprobs[ix, start : ends[ix]] for ix in range(n_samples)]
             all_ref_logprobs = [ref_logprobs[ix, start : ends[ix]] for ix in range(n_samples)]
 
-            # CHANGED
             kl_penalty = self.kl_ctl.value * -log_ratio.cpu()
             kl_penalty = [xs[start : ends[ix]] for ix, xs in enumerate(kl_penalty)]
-            # /CHANGED
 
             rollout_count = 0
 
             for sample_idx in range(n_samples):
-                # CHANGED
-                rewards = torch.zeros_like(kl_penalty[sample_idx])
-                if not self.config.method.regularize_in_loss:
-                    if self.use_end_kl:
-                        rewards[-1] = kl_penalty[sample_idx].sum()
-                    elif not self.use_sqrt_chi2:
-                        rewards += kl_penalty[sample_idx]
-                seq_ratios_m_1.append(seq_ratio_m_1[sample_idx].item())
-                # /CHANGED
                 # Then add in rewards
                 if scores.shape[1] == 1:
                     # NOTE: Final reward given at EOS token following HHH practice
@@ -616,33 +593,6 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
 
         stats["kl_ctl_value"] = self.kl_ctl.value
         self.mean_kl = stats["policy/sqrt_kl"] ** 2
-
-        # CHANGED
-        del seq_ratio_m_1
-        seq_ratios_m_1 = torch.tensor(seq_ratios_m_1)
-        chi2_est = seq_ratios_m_1.mean()
-        seq_ratios_m_1_sorted = torch.sort(seq_ratios_m_1).values
-        i = max(1, int(0.01 * len(seq_ratios_m_1_sorted)))
-        chi2_trimmed = torch.mean(seq_ratios_m_1_sorted[i:-i])
-        if chi2_trimmed.item() <= 0:
-            chi2_factor = 1.0
-        else:
-            chi2_factor = 1.0 / torch.sqrt(chi2_trimmed)
-
-        stats["policy/chi2"] = chi2_est.item()
-        stats["policy/chi2_trimmed"] = chi2_trimmed.item()
-
-        if self.use_sqrt_chi2 and not self.config.method.regularize_in_loss:
-            chi2_rewards = []
-            for sample_idx, element in enumerate(ppo_rl_elements):
-                chi2_reward = (
-                    self.kl_ctl.value * -seq_ratios_m_1[sample_idx] * chi2_factor
-                )
-                chi2_reward = chi2_reward.clip(min=-self.chi2_reward_clip, max=self.chi2_reward_clip).item()
-                element.rewards[-1] += chi2_reward
-                chi2_rewards.append(chi2_reward)
-            stats["policy/chi2_reward"] = np.mean(chi2_rewards)
-        # /CHANGED
 
         self.accelerator.log(stats, step=iter_count)
         
