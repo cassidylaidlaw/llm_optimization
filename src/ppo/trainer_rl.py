@@ -70,7 +70,6 @@ def argument_parsing(notebook=False, notebook_args=None, **kwargs):
 def main():
     training_conf = argument_parsing(
         use_sqrt_chi2=False,
-        use_end_kl=False,
         regularize_in_loss=False,
         coeff=0.0,
     )
@@ -89,11 +88,8 @@ def main():
     # override model_name to be the same as sft_model
     trlx_config = TRLConfig.load_yaml("configs/ppo_config.yaml")
     trlx_config.sft_config = sft_config
-    trlx_config.method.use_end_kl = training_conf.use_end_kl
     trlx_config.method.use_sqrt_chi2 = training_conf.use_sqrt_chi2
-    assert not (training_conf.use_end_kl and training_conf.use_sqrt_chi2)
     trlx_config.method.init_kl_coef = training_conf.coeff
-    trlx_config.method.chi2_reward_clip = 10
     trlx_config.method.regularize_in_loss = training_conf.regularize_in_loss
 
     train, eval_dict = get_dataset(training_conf, mode="rl")
@@ -128,14 +124,12 @@ def main():
     extra_dirs = ""
     if training_conf.use_sqrt_chi2:
         divergence_type = "sqrt_chi2"
-    elif training_conf.use_end_kl:
-        divergence_type = "end_kl"
+        if not training_conf.regularize_in_loss:
+            raise ValueError("sqrt_chi2 requires regularize_in_loss")
     else:
         divergence_type = "kl"
     if training_conf.regularize_in_loss:
-        divergence_type += "_in_loss_clipped"
-    else:
-        extra_dirs = f"clip_{trlx_config.method.chi2_reward_clip}/"
+        divergence_type += "_in_loss"
     extra_dirs += f"{divergence_type}-{training_conf.coeff}"
     if training_conf.rng_seed is not None:
         extra_dirs += f"/seed_{training_conf.rng_seed}"
