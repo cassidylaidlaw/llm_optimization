@@ -92,6 +92,10 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
         else:
             self.kl_ctl = FixedKLController(config.method.init_kl_coef)
 
+        # CHANGED
+        self.use_sqrt_chi2 = config.method.use_sqrt_chi2
+        # /CHANGED
+
         # Create the parameters for the Hugging Face language model's generator
         # method (that generates new tokens from a prompt).
         # https://huggingface.co/docs/transformers/v4.25.1/en/main_classes/text_generation#transformers.GenerationMixin.generate
@@ -542,6 +546,7 @@ class CustomAcceleratePPOTrainer(CustomAccelerateRLTrainer):
             rollout_count = 0
 
             for sample_idx in range(n_samples):
+                rewards = kl_penalty[sample_idx]
                 # Then add in rewards
                 if scores.shape[1] == 1:
                     # NOTE: Final reward given at EOS token following HHH practice
